@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -84,21 +85,62 @@ def run_query(q: str, search, reranker, top_k: int) -> tuple[str, list[str]]:
 
     if OPENAI_API_KEY and contexts:
         try:
-            from openai import OpenAI
-            client = OpenAI()
-            ctx = "\n\n".join(contexts)
-            resp = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "Trả lời CHỈ dựa trên context. Nếu không có → nói 'Không tìm thấy.'"},
-                    {"role": "user",   "content": f"Context:\n{ctx}\n\nCâu hỏi: {q}"},
-                ],
+            from src.openai_client import chat_json
+            context_text = "\n\n".join(contexts)
+            payload = chat_json(
+                "Tra loi cau hoi HR chi dua tren context. Tra ve JSON co key answer.",
+                f"Context:\n{context_text}\n\nCau hoi: {q}",
             )
-            return resp.choices[0].message.content, contexts
+            return str(payload["answer"]), contexts
         except Exception as e:
             print(f"  ⚠️  LLM generation failed: {e}")
 
     return (contexts[0] if contexts else "Không tìm thấy thông tin."), contexts
+
+
+def run_batch(items: list[dict], search, reranker, top_k: int) -> list[dict]:
+    from config import OPENAI_API_KEY
+
+    prepared = []
+    for item in items:
+        results = search.search(item["question"])
+        documents = [{"text": result.text, "score": result.score, "metadata": result.metadata}
+                     for result in results]
+        reranked = reranker.rerank(item["question"], documents, top_k=top_k)
+        contexts = [result.text for result in reranked] or [result.text for result in results[:3]]
+        prepared.append({**item, "contexts": contexts})
+
+    generated: dict[int, str] = {}
+    if OPENAI_API_KEY:
+        try:
+            from src.openai_client import chat_json
+            request_items = [
+                {"id": item["id"], "question": item["question"],
+                 "contexts": [context[:2500] for context in item["contexts"]]}
+                for item in prepared
+            ]
+            payload = chat_json(
+                "Ban la tro ly HR. Tra loi bang tieng Viet, chi dung context, uu tien policy hien hanh. "
+                "Neu context thieu, noi ro khong tim thay. Tra ve JSON object voi key answers.",
+                "Tra loi tung cau. answers la mang cac object {id, answer}, giu dung id:\n"
+                + json.dumps(request_items, ensure_ascii=False),
+                timeout=120,
+            )
+            generated = {int(row["id"]): str(row["answer"]) for row in payload.get("answers", [])}
+        except Exception as error:
+            print(f"  API batch failed; using extractive fallback: {error}")
+
+    return [
+        {
+            "id": item["id"],
+            "distribution": item["distribution"],
+            "question": item["question"],
+            "answer": generated.get(item["id"], item["contexts"][0] if item["contexts"] else "Không tìm thấy thông tin."),
+            "contexts": item["contexts"],
+            "ground_truth": item["ground_truth"],
+        }
+        for item in prepared
+    ]
 
 
 def main():
@@ -123,19 +165,13 @@ def main():
     print(f"\nRunning {len(test_set)} queries...")
     answers = []
     t_start = time.time()
-
-    for i, item in enumerate(test_set):
-        answer, contexts = run_query(item["question"], search, reranker, top_k)
-        answers.append({
-            "id":           item["id"],
-            "distribution": item["distribution"],
-            "question":     item["question"],
-            "answer":       answer,
-            "contexts":     contexts,
-            "ground_truth": item["ground_truth"],
-        })
-        if (i + 1) % 10 == 0:
-            print(f"  [{i+1}/{len(test_set)}] done ({time.time()-t_start:.0f}s elapsed)")
+    batches = [test_set[index:index + 10] for index in range(0, len(test_set), 10)]
+    with ThreadPoolExecutor(max_workers=min(5, len(batches))) as executor:
+        futures = [executor.submit(run_batch, batch, search, reranker, top_k) for batch in batches]
+        for future in as_completed(futures):
+            answers.extend(future.result())
+            print(f"  [{len(answers)}/{len(test_set)}] done ({time.time()-t_start:.0f}s elapsed)")
+    answers.sort(key=lambda item: item["id"])
 
     with open("answers_50q.json", "w", encoding="utf-8") as f:
         json.dump(answers, f, ensure_ascii=False, indent=2)
