@@ -9,3 +9,7 @@ venv/
 answers_50q.json
 reports/*.json
 !reports/.gitkeep
+.cache/
+.pip-inspect/
+:memory:.ses
+.pytest_cache/

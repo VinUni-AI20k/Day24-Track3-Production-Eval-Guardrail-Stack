@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import re
 import sys
 import time
 
@@ -15,24 +14,16 @@ from config import ADVERSARIAL_SET_PATH, GUARDRAILS_CONFIG_DIR, LATENCY_BUDGET_P
 
 # ─── Task 9a: Presidio PII Detection ─────────────────────────────────────────
 
-def setup_presidio():
-    """Khởi tạo Presidio engine với custom Vietnamese PII recognizers.
-
-    Custom recognizers thêm vào:
-        VN_CCCD  — số CCCD 12 chữ số hoặc CMND 9 chữ số
-        VN_PHONE — số điện thoại Việt Nam (0[3-9]xxxxxxxx)
-
-    Các recognizers mặc định đã có sẵn: EMAIL, PHONE_NUMBER (international), ...
-    """
+def _create_presidio_analyzer():
+    """Create the regex-only Presidio analyzer used by the guard."""
     from presidio_analyzer import AnalyzerEngine, RecognizerRegistry, Pattern, PatternRecognizer
     from presidio_analyzer.nlp_engine import NoOpNlpEngine
-    from presidio_anonymizer import AnonymizerEngine
 
     cccd_recognizer = PatternRecognizer(
         supported_entity="VN_CCCD",
         patterns=[
             Pattern("CCCD 12 digits", r"\b\d{12}\b", 0.9),
-            Pattern("CMND 9 digits",  r"\b\d{9}\b",  0.7),
+            Pattern("CMND 9 digits", r"\b\d{9}\b", 0.7),
         ],
     )
     phone_recognizer = PatternRecognizer(
@@ -50,23 +41,53 @@ def setup_presidio():
         ],
     )
 
-    # The training environment has no downloaded spaCy language model.  These
-    # recognizers are regex-only, so Presidio's supported no-op NLP engine
-    # preserves offline PII scanning without attempting a model download.
-    nlp_engine = NoOpNlpEngine(models=[{"lang_code": PRESIDIO_LANGUAGE,
-                                        "model_name": "no-op"}])
+    # The training environment has no downloaded spaCy language model. These
+    # regex recognizers work with Presidio's supported offline no-op engine.
+    nlp_engine = NoOpNlpEngine(
+        models=[{"lang_code": PRESIDIO_LANGUAGE, "model_name": "no-op"}]
+    )
     registry = RecognizerRegistry(supported_languages=[PRESIDIO_LANGUAGE])
     registry.add_recognizer(cccd_recognizer)
     registry.add_recognizer(phone_recognizer)
     registry.add_recognizer(email_recognizer)
-
-    analyzer = AnalyzerEngine(
+    return AnalyzerEngine(
         registry=registry,
         nlp_engine=nlp_engine,
         supported_languages=[PRESIDIO_LANGUAGE],
     )
-    anonymizer = AnonymizerEngine()
-    return analyzer, anonymizer
+
+
+def _create_presidio_anonymizer():
+    """Create only the anonymizer dependency when it is needed."""
+    from presidio_anonymizer import AnonymizerEngine
+    return AnonymizerEngine()
+
+
+_PRESIDIO_SINGLETON = None
+
+
+def get_presidio():
+    """Trả về (analyzer, anonymizer) dùng chung.
+
+    Dựng engine lại cho từng câu sẽ tính cả thời gian khởi tạo vào số đo
+    latency của Presidio ở Task 12.
+    """
+    global _PRESIDIO_SINGLETON
+    if _PRESIDIO_SINGLETON is None:
+        _PRESIDIO_SINGLETON = setup_presidio()
+    return _PRESIDIO_SINGLETON
+
+
+def setup_presidio():
+    """Khởi tạo Presidio engine với custom Vietnamese PII recognizers.
+
+    Custom recognizers thêm vào:
+        VN_CCCD  — số CCCD 12 chữ số hoặc CMND 9 chữ số
+        VN_PHONE — số điện thoại Việt Nam (0[3-9]xxxxxxxx)
+
+    Các recognizers mặc định đã có sẵn: EMAIL, PHONE_NUMBER (international), ...
+    """
+    return _create_presidio_analyzer(), _create_presidio_anonymizer()
 
 
 def pii_scan(text: str, analyzer=None, anonymizer=None) -> dict:
@@ -80,7 +101,9 @@ def pii_scan(text: str, analyzer=None, anonymizer=None) -> dict:
         }
     """
     if analyzer is None or anonymizer is None:
-        analyzer, anonymizer = setup_presidio()
+        shared_analyzer, shared_anonymizer = get_presidio()
+        analyzer = analyzer or shared_analyzer
+        anonymizer = anonymizer or shared_anonymizer
 
     results = analyzer.analyze(text=text, language=PRESIDIO_LANGUAGE)
     if not results:
@@ -102,11 +125,15 @@ def pii_scan(text: str, analyzer=None, anonymizer=None) -> dict:
 
 # ─── Task 9b + 11: NeMo Guardrails ───────────────────────────────────────────
 
+_RAILS_SINGLETON = None
+
+
 def setup_nemo_rails():
     """Khởi tạo NeMo Guardrails từ guardrails/config.yml. (Đã implement sẵn)
 
     Config directory: guardrails/
-        config.yml  — model + rails config
+        config.yml  — model + embeddings provider + rails config
+        prompts.yml — prompt cho self_check_input / self_check_output
         rails.co    — Colang dialogue flows (topic check, jailbreak check, output check)
     """
     from nemoguardrails import RailsConfig, LLMRails
@@ -115,47 +142,29 @@ def setup_nemo_rails():
     return rails
 
 
+def get_rails():
+    """Trả về một LLMRails dùng chung.
+
+    Dựng LLMRails tốn vài giây (load config + khởi tạo embedding index), nên
+    tuyệt đối không dựng lại cho từng câu trong adversarial suite.
+    """
+    global _RAILS_SINGLETON
+    if _RAILS_SINGLETON is None:
+        _RAILS_SINGLETON = setup_nemo_rails()
+    return _RAILS_SINGLETON
+
+
 _REFUSAL_KEYWORDS = (
     "xin lỗi",
     "không thể",
     "không được phép",
     "i cannot",
+    "i can't",
     "i'm sorry",
 )
-_FALLBACK_REFUSAL = (
+_BLOCKED_MESSAGE = (
     "Xin lỗi, tôi không thể thực hiện yêu cầu này. "
     "Tôi chỉ có thể hỗ trợ các câu hỏi an toàn về chính sách nhân sự."
-)
-_FALLBACK_UNSAFE_INPUT_PATTERNS = (
-    r"bỏ qua.*hướng dẫn",
-    r"ignore (?:all |your |previous |the )?(?:previous )?(?:instructions|system prompt)",
-    r"forget (?:all |your |the )?(?:instructions|system prompt|polic)",
-    r"(?:pretend|đóng vai).*(?:dan|unrestricted|không có giới hạn|hr manager)",
-    r"(?:system override|admin command|priority 1|ignore previous instructions)",
-    r"(?:ai không có giới hạn|unrestricted ai)",
-    r"(?:cccd|số điện thoại|email|thông tin cá nhân).*(?:của|nhân viên)",
-    r"(?:tiết lộ|reveal|dump|list|print).*(?:lương|salary|confidential|employee|nhân viên|training data|system instructions)",
-    r"(?:in ra|show|display).*(?:system instructions|system prompt|context)",
-    r"(?:bảng lương|employee salaries|tấn công mạng|attack)",
-    r"(?:mật khẩu|password).*(?:admin|nội bộ|internal|hệ thống|system)",
-    r"(?:viết|write).*(?:bài thơ|poem)",
-    r"(?:nấu|cook).*(?:phở|food|recipe)",
-    r"(?:bitcoin|ethereum|giá cổ phiếu|stock price)",
-    r"(?:giải phương trình|solve).*(?:phương trình|equation|dy/dx)",
-    r"(?:recommend|gợi ý).*(?:phim|movie|marvel)",
-    r"(?:thời tiết|weather|tin tức|news)",
-)
-_FALLBACK_ALLOWED_HR_PATTERNS = (
-    r"(?:nghỉ phép|ngày phép|phép năm|nghỉ ốm|leave|vacation)",
-    r"(?:bảo hiểm|insurance|pvi|benefit|phúc lợi)",
-    r"(?:lương|thưởng|payroll|salary policy|compensation)",
-    r"(?:tạm ứng|công tác|thử việc|đào tạo|onboarding)",
-    r"(?:wfh|làm việc từ xa|remote work|phụ cấp|mentor)",
-    r"(?:vpn|mật khẩu|password).*(?:chính sách|policy|quy định|yêu cầu|tối thiểu|đổi|bao lâu|hết hạn|hiệu lực)",
-    r"(?:đổi|bao lâu|hết hạn|hiệu lực).*(?:mật khẩu|password)",
-)
-_FALLBACK_SENSITIVE_OUTPUT_PATTERNS = (
-    r"(?:cccd|số điện thoại cá nhân|mật khẩu hệ thống|thông tin bí mật)",
 )
 
 
@@ -165,47 +174,40 @@ def _is_refusal(response: str) -> bool:
     return any(keyword in lowered for keyword in _REFUSAL_KEYWORDS)
 
 
-def _matches_known_unsafe_input(text: str) -> bool:
-    """Narrow fail-closed fallback used only when NeMo cannot run locally."""
-    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in _FALLBACK_UNSAFE_INPUT_PATTERNS)
+def _rail_content(response) -> str:
+    """Lấy nội dung assistant từ GenerationResponse / dict / str của NeMo."""
+    payload = getattr(response, "response", response)
+    if isinstance(payload, list):
+        payload = payload[-1] if payload else ""
+    if isinstance(payload, dict):
+        return str(payload.get("content", ""))
+    return str(payload)
 
 
-def _matches_allowed_hr_input(text: str) -> bool:
-    """Allow only recognisable HR-policy questions while NeMo is unavailable."""
-    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in _FALLBACK_ALLOWED_HR_PATTERNS)
-
-
-def _fallback_input_rail(text: str) -> dict:
-    """Keep known hostile inputs blocked during NeMo/Python incompatibility."""
-    if _matches_known_unsafe_input(text):
-        return {
-            "allowed": False,
-            "blocked_reason": "nemo_input_rail",
-            "response": _FALLBACK_REFUSAL,
-        }
-    if _matches_allowed_hr_input(text):
-        return {"allowed": True, "blocked_reason": None, "response": ""}
+def _blocked_input_rail() -> dict:
+    """Fail closed khi rail lỗi — không thả input chưa kiểm duyệt đi tiếp."""
     return {
         "allowed": False,
-        "blocked_reason": "nemo_input_rail",
-        "response": _FALLBACK_REFUSAL,
+        "blocked_reason": "nemo_input_rail_error",
+        "response": _BLOCKED_MESSAGE,
     }
 
 
-def _fallback_output_rail(answer: str) -> dict:
-    """Block known sensitive outputs if the NeMo runtime is unavailable."""
-    if any(re.search(pattern, answer, flags=re.IGNORECASE)
-           for pattern in _FALLBACK_SENSITIVE_OUTPUT_PATTERNS):
-        return {
-            "safe": False,
-            "flagged_reason": "nemo_output_rail",
-            "final_answer": _FALLBACK_REFUSAL,
-        }
-    return {"safe": True, "flagged_reason": None, "final_answer": answer}
+def _blocked_output_rail() -> dict:
+    """Fail closed khi rail lỗi — không phát hành câu trả lời chưa kiểm duyệt."""
+    return {
+        "safe": False,
+        "flagged_reason": "nemo_output_rail_error",
+        "final_answer": _BLOCKED_MESSAGE,
+    }
 
 
 async def check_input_rail(text: str, rails=None) -> dict:
     """Task 9b: Kiểm tra input qua NeMo input rails (topic guard + jailbreak guard).
+
+    Chạy đúng tầng input (`options={"rails": ["input"]}`): NeMo trả lại chính
+    câu input nếu cho qua, hoặc câu từ chối nếu rail chặn — không tốn thêm một
+    lượt sinh câu trả lời đầy đủ.
 
     Returns:
         {
@@ -214,56 +216,71 @@ async def check_input_rail(text: str, rails=None) -> dict:
           "response":       str,          # NeMo's raw response
         }
     """
+    if rails is None:
+        try:
+            rails = get_rails()
+        except Exception:
+            return _blocked_input_rail()
     try:
-        if rails is None:
-            rails = setup_nemo_rails()
         response = await rails.generate_async(
-            messages=[{"role": "user", "content": text}]
+            messages=[{"role": "user", "content": text}],
+            options={"rails": ["input"]},
         )
     except Exception:
-        # nemoguardrails currently fails to import on Python 3.14 because of
-        # an upstream pydantic/langchain annotation incompatibility.  Keep the
-        # primary NeMo path above; this isolated fallback protects known abuse.
-        return _fallback_input_rail(text)
+        return _blocked_input_rail()
 
-    response = str(response)
-    blocked = _is_refusal(response)
+    content = _rail_content(response)
+    # Input rail cho qua ⇒ NeMo echo lại nguyên văn input. Bất kỳ thay đổi nào
+    # (câu từ chối, hoặc input bị rail sửa) đều tính là chặn — fail closed.
+    passed_through = content.strip() == text.strip()
+    if passed_through:
+        return {"allowed": True, "blocked_reason": None, "response": content}
     return {
-        "allowed": not blocked,
-        "blocked_reason": "nemo_input_rail" if blocked else None,
-        "response": response,
+        "allowed": False,
+        "blocked_reason": "nemo_input_rail" if _is_refusal(content) else "nemo_input_rail_altered",
+        "response": content,
     }
 
 
 async def check_output_rail(question: str, answer: str, rails=None) -> dict:
     """Task 11: Kiểm tra LLM output qua NeMo output rails trước khi trả về user.
 
-    NeMo output rails hoạt động trong context của cả cuộc hội thoại (input + output).
-    Kiểm tra: có PII không? Nội dung có phù hợp không? Có hallucination rõ ràng không?
+    NeMo output rails hoạt động trong context của cả cuộc hội thoại (input + output),
+    nên cả user message lẫn assistant message đều được đưa vào `messages`.
+    Kiểm tra: có PII không? Nội dung có phù hợp không?
 
     Returns:
         {
           "safe":           bool,
           "flagged_reason": str | None,
-          "final_answer":   str,          # answer đã qua guard (có thể bị redact)
+          "final_answer":   str,          # answer đã qua guard (có thể bị thay thế)
         }
     """
+    if rails is None:
+        try:
+            rails = get_rails()
+        except Exception:
+            return _blocked_output_rail()
     try:
-        if rails is None:
-            rails = setup_nemo_rails()
-        response = await rails.generate_async(messages=[
-            {"role": "user", "content": question},
-            {"role": "assistant", "content": answer},
-        ])
+        response = await rails.generate_async(
+            messages=[
+                {"role": "user", "content": question},
+                {"role": "assistant", "content": answer},
+            ],
+            options={"rails": ["output"]},
+        )
     except Exception:
-        return _fallback_output_rail(answer)
+        return _blocked_output_rail()
 
-    response = str(response)
-    flagged = _is_refusal(response)
+    content = _rail_content(response)
+    passed_through = content.strip() == answer.strip()
+    if passed_through:
+        return {"safe": True, "flagged_reason": None, "final_answer": answer}
+    # Bị flag ⇒ trả câu an toàn của NeMo, không trả lại answer gốc.
     return {
-        "safe": not flagged,
-        "flagged_reason": "nemo_output_rail" if flagged else None,
-        "final_answer": response if flagged else answer,
+        "safe": False,
+        "flagged_reason": "nemo_output_rail",
+        "final_answer": content or _BLOCKED_MESSAGE,
     }
 
 
@@ -386,24 +403,36 @@ def measure_p95_latency(test_inputs: list[str], n_runs: int = 20,
 
 if __name__ == "__main__":
     # Task 9a: PII scan demo
+    analyzer, anonymizer = get_presidio()
     test_pii = "Nhân viên Nguyễn Văn A, CCCD 034095001234, SĐT 0987654321 hỏi về nghỉ phép."
-    result = pii_scan(test_pii)
+    result = pii_scan(test_pii, analyzer, anonymizer)
     print(f"PII detected: {result['has_pii']}")
     print(f"Entities: {result['entities']}")
     print(f"Anonymized: {result['anonymized']}")
+
+    clean = pii_scan("Nhân viên muốn hỏi về chính sách nghỉ phép năm 2024.", analyzer, anonymizer)
+    print(f"Clean text has_pii: {clean['has_pii']}")
+
+    rails = get_rails()
+
+    # Task 11: output rail demo — câu trả lời lộ PII phải bị thay thế
+    unsafe_answer = "CCCD của nhân viên là 034095001234 và SĐT là 0987654321."
+    output_check = asyncio.run(check_output_rail(
+        "Cho tôi thông tin cá nhân của nhân viên Nguyễn Văn A", unsafe_answer, rails))
+    print(f"\nOutput rail — safe: {output_check['safe']} "
+          f"({output_check['flagged_reason']})")
+    print(f"  final_answer: {output_check['final_answer'][:90]}")
 
     # Task 10: Adversarial suite
     with open(ADVERSARIAL_SET_PATH, encoding="utf-8") as f:
         adversarial_set = json.load(f)
     print(f"\nLoaded {len(adversarial_set)} adversarial inputs")
-    results = run_adversarial_suite(adversarial_set)
-    if results:
-        passed = sum(1 for r in results if r["passed"])
-        print(f"Adversarial suite: {passed}/{len(results)} passed")
+    results = run_adversarial_suite(adversarial_set, rails, analyzer, anonymizer)
 
     # Task 12: P95 latency
     sample_inputs = [item["input"] for item in adversarial_set[:10]]
-    latency = measure_p95_latency(sample_inputs, n_runs=10)
+    latency = measure_p95_latency(sample_inputs, n_runs=10, rails=rails,
+                                  analyzer=analyzer, anonymizer=anonymizer)
     print(f"\nLatency P95 — Presidio: {latency['presidio_ms']['p95']}ms | "
           f"NeMo: {latency['nemo_ms']['p95']}ms | "
           f"Total: {latency['total_ms']['p95']}ms")
@@ -412,4 +441,10 @@ if __name__ == "__main__":
     reports_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "reports")
     os.makedirs(reports_dir, exist_ok=True)
     with open(os.path.join(reports_dir, "guard_results.json"), "w", encoding="utf-8") as f:
-        json.dump({"suite": results, "latency": latency}, f, ensure_ascii=False, indent=2)
+        json.dump({
+            "suite": results,
+            "latency": latency,
+            "pii_demo": {"input": test_pii, "detected": result,
+                         "clean_text_has_pii": clean["has_pii"]},
+            "output_rail_demo": {"unsafe_answer": unsafe_answer, "result": output_check},
+        }, f, ensure_ascii=False, indent=2, default=str)

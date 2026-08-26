@@ -19,6 +19,11 @@ DIAGNOSTIC_TREE = {
     "answer_relevancy":  ("Answer doesn't match question", "Improve prompt template"),
 }
 
+# Ngưỡng để tính một câu là "failure" trong cluster_analysis(). Đếm mọi câu
+# (kể cả câu tốt) sẽ làm mỗi cột chỉ bằng size của distribution → dominant
+# distribution luôn là nhóm đông nhất chứ không phải nhóm hay hỏng nhất.
+FAILURE_THRESHOLD = 0.7
+
 
 @dataclass
 class RagasResult:
@@ -40,13 +45,25 @@ class RagasResult:
 
     @property
     def worst_metric(self) -> str:
-        scores = {
+        return min(self.metrics, key=self.metrics.get)
+
+    @property
+    def metrics(self) -> dict[str, float]:
+        return {
             "faithfulness":      self.faithfulness,
             "answer_relevancy":  self.answer_relevancy,
             "context_precision": self.context_precision,
             "context_recall":    self.context_recall,
         }
-        return min(scores, key=scores.get)
+
+    @property
+    def worst_score(self) -> float:
+        return self.metrics[self.worst_metric]
+
+    @property
+    def is_failure(self) -> bool:
+        """Câu hỏi được coi là failure khi metric yếu nhất tụt dưới ngưỡng."""
+        return self.worst_score < FAILURE_THRESHOLD
 
 
 # ─── Đã implement sẵn ────────────────────────────────────────────────────────
@@ -91,6 +108,21 @@ def save_phase_a_report(results: list[RagasResult], clusters: dict,
         "per_distribution": per_dist,
         "failure_clusters": clusters,
         "bottom_10": bottom_10(results),
+        "per_question": [
+            {
+                "question_id": r.question_id,
+                "distribution": r.distribution,
+                "question": r.question,
+                "faithfulness": round(r.faithfulness, 4),
+                "answer_relevancy": round(r.answer_relevancy, 4),
+                "context_precision": round(r.context_precision, 4),
+                "context_recall": round(r.context_recall, 4),
+                "avg_score": round(r.avg_score, 4),
+                "worst_metric": r.worst_metric,
+                "is_failure": r.is_failure,
+            }
+            for r in results
+        ],
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
@@ -191,21 +223,46 @@ def cluster_analysis(results: list[RagasResult]) -> dict:
         metric: {distribution: 0 for distribution in distributions}
         for metric in DIAGNOSTIC_TREE
     }
-    for result in results:
+    # Chỉ đếm câu THỰC SỰ hỏng (worst metric < FAILURE_THRESHOLD). Nếu đếm cả
+    # câu đạt, tổng mỗi cột luôn bằng số câu của distribution đó → so sánh
+    # giữa các cột trở nên vô nghĩa.
+    failures = [result for result in results if result.is_failure]
+    for result in failures:
         matrix[result.worst_metric][result.distribution] += 1
 
-    dominant_distribution = max(
-        distributions,
-        key=lambda distribution: sum(matrix[metric][distribution] for metric in matrix),
-    )
+    group_sizes = {
+        distribution: sum(1 for r in results if r.distribution == distribution)
+        for distribution in distributions
+    }
+    failure_counts = {
+        distribution: sum(matrix[metric][distribution] for metric in matrix)
+        for distribution in distributions
+    }
+    # So sánh theo TỶ LỆ hỏng: adversarial chỉ có 10 câu, so số tuyệt đối với
+    # nhóm 20 câu sẽ luôn thiệt.
+    failure_rates = {
+        distribution: (failure_counts[distribution] / group_sizes[distribution]
+                       if group_sizes[distribution] else 0.0)
+        for distribution in distributions
+    }
+
+    dominant_distribution = max(distributions, key=lambda d: (failure_rates[d], failure_counts[d]))
     dominant_metric = max(matrix, key=lambda metric: sum(matrix[metric].values()))
     insight = (
-        f"Distribution '{dominant_distribution}' có nhiều failure nhất. "
-        f"Metric '{dominant_metric}' là điểm yếu chủ đạo. "
+        f"Distribution '{dominant_distribution}' có tỷ lệ failure cao nhất "
+        f"({failure_counts[dominant_distribution]}/{group_sizes[dominant_distribution]} câu = "
+        f"{failure_rates[dominant_distribution]:.0%}, ngưỡng worst metric < {FAILURE_THRESHOLD}). "
+        f"Metric '{dominant_metric}' là điểm yếu chủ đạo "
+        f"({sum(matrix[dominant_metric].values())}/{len(failures)} failure). "
         f"Gợi ý: {DIAGNOSTIC_TREE[dominant_metric][1]}"
     )
     return {
         "matrix": matrix,
+        "failure_threshold": FAILURE_THRESHOLD,
+        "total_failures": len(failures),
+        "group_sizes": group_sizes,
+        "failure_counts": failure_counts,
+        "failure_rates": {d: round(rate, 3) for d, rate in failure_rates.items()},
         "dominant_failure_distribution": dominant_distribution,
         "dominant_failure_metric": dominant_metric,
         "insight": insight,

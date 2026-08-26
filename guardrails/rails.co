@@ -84,7 +84,7 @@ define user ask about hr policy
   "phụ cấp"
   "mentor"
 
-define flow self check facts
-  $facts = execute check_facts
-  if not $facts.accurate
-    bot say "Lưu ý: Câu trả lời trên có thể không chính xác. Vui lòng xác nhận với phòng Nhân sự."
+# `define flow self check facts` đã bị bỏ: nó mở đầu bằng
+# `$facts = execute check_facts` nên NeMo coi đây là flow tự khởi động, rồi
+# gọi một action chưa đăng ký → toàn bộ generate_async trả về chuỗi rỗng.
+# Fact-checking cần config riêng (rails.output.flows + prompt self_check_facts).

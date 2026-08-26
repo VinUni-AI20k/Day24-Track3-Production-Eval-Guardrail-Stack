@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import OPENAI_API_KEY, JUDGE_MODEL, HUMAN_LABELS_PATH
+from config import OPENAI_API_KEY, JUDGE_MODEL, HUMAN_LABELS_PATH, TEST_SET_PATH
 
 
 @dataclass
@@ -130,6 +130,57 @@ def swap_and_average(question: str, answer_a: str, answer_b: str) -> JudgeResult
     )
 
 
+# ─── Nhãn judge cho Cohen's κ ─────────────────────────────────────────────────
+
+def grade_answer(question: str, answer: str, reference: str) -> dict:
+    """Chấm nhị phân một câu trả lời so với ground truth.
+
+    Đây là nhiệm vụ chấm giống hệt nhiệm vụ của người trong
+    human_labels_10q.json (1 = tốt, 0 = xấu), nên nhãn trả về mới so sánh
+    được với nhãn người bằng Cohen's κ. Pairwise "A hay B tốt hơn" là một
+    thang khác — nó trộn độ chính xác với độ đầy đủ — nên chỉ dùng cho
+    bias_report(), không dùng làm nhãn κ.
+
+    Returns:
+        {"label": 1|0, "reasoning": str}
+    """
+    prompt = f'''Bạn là expert kiểm định chất lượng câu trả lời RAG về chính sách nội bộ.
+
+Câu hỏi: {question}
+
+Đáp án đúng (ground truth):
+{reference}
+
+Câu trả lời của model:
+{answer}
+
+Chấm câu trả lời của model theo thang nhị phân:
+- label = 1 (TỐT): đúng sự thật so với ground truth VÀ trả lời được ý chính của câu hỏi.
+- label = 0 (XẤU): sai sự thật, mâu thuẫn với ground truth, hoặc bỏ sót ý chính.
+
+Câu trả lời ngắn gọn nhưng đúng vẫn là TỐT. Chỉ chấm 0 khi thực sự sai hoặc thiếu ý chính.
+
+Trả lời JSON (chỉ JSON, không text khác):
+{{"label": 0 hoặc 1, "reasoning": "giải thích ngắn gọn"}}'''
+
+    from openai import OpenAI
+
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    response = client.chat.completions.create(
+        model=JUDGE_MODEL,
+        messages=[
+            {"role": "system", "content": "Bạn là expert kiểm định RAG. Chỉ trả lời JSON."},
+            {"role": "user", "content": prompt},
+        ],
+        response_format={"type": "json_object"},
+    )
+    payload = json.loads(response.choices[0].message.content)
+    label = payload.get("label")
+    if label not in (0, 1):
+        raise ValueError(f"grade_answer nhận label không hợp lệ: {label!r}")
+    return {"label": int(label), "reasoning": str(payload.get("reasoning", ""))}
+
+
 # ─── Task 7: Cohen's κ ────────────────────────────────────────────────────────
 
 def cohen_kappa(judge_labels: list[int], human_labels: list[int]) -> float:
@@ -210,11 +261,14 @@ def bias_report(judge_results: list[JudgeResult]) -> dict:
     decisive = sum(result.final_winner != "tie" for result in judge_results)
     position_bias_rate = position_bias_count / total if total else 0.0
     verbosity_bias = (a_wins_a_longer + b_wins_b_longer) / decisive if decisive else 0.0
-    interpretation = (
+    interpretation = " ".join([
         "Position bias cao — nên dùng swap-and-average."
         if position_bias_rate > 0.3
-        else "Position bias thấp — judge ổn định."
-    )
+        else "Position bias thấp — judge ổn định.",
+        "Verbosity bias đáng lo ngại — judge gần như luôn chọn câu dài hơn."
+        if verbosity_bias > 0.6
+        else "Verbosity bias trong ngưỡng chấp nhận được.",
+    ])
     return {
         "total_judged": total,
         "position_bias_rate": round(position_bias_rate, 3),
@@ -234,17 +288,38 @@ def bias_report(judge_results: list[JudgeResult]) -> dict:
 if __name__ == "__main__":
     with open(HUMAN_LABELS_PATH, encoding="utf-8") as f:
         human_data = json.load(f)
+    with open(TEST_SET_PATH, encoding="utf-8") as f:
+        ground_truths = {item["id"]: item["ground_truth"] for item in json.load(f)}
+
+    # A = câu trả lời của model, B = ground truth. Cặp thật (không phải chuỗi
+    # rỗng) mới đo được position/verbosity bias có ý nghĩa.
     results = [
-        swap_and_average(item["question"], item["model_answer"], "")
+        swap_and_average(item["question"], item["model_answer"],
+                         ground_truths[item["question_id"]])
         for item in human_data
     ]
+
     human_labels = [item["human_label"] for item in human_data]
-    judge_labels = [int(result.final_winner == "A") for result in results]
+    grades = [
+        grade_answer(item["question"], item["model_answer"],
+                     ground_truths[item["question_id"]])
+        for item in human_data
+    ]
+    judge_labels = [g["label"] for g in grades]
+
     kappa = cohen_kappa(judge_labels, human_labels)
     bias = bias_report(results)
     report = {
         "human_labels": human_labels,
         "judge_labels": judge_labels,
+        "judge_grades": [
+            {"question_id": item["question_id"], "question": item["question"],
+             "model_answer": item["model_answer"],
+             "human_label": item["human_label"], "human_note": item["human_note"],
+             "judge_label": grade["label"], "judge_reasoning": grade["reasoning"],
+             "agree": item["human_label"] == grade["label"]}
+            for item, grade in zip(human_data, grades)
+        ],
         "results": [asdict(result) for result in results],
         "cohen_kappa": kappa,
         "bias": bias,
@@ -254,3 +329,9 @@ if __name__ == "__main__":
     with report_path.open("w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
     print(f"Judge report written to {report_path}")
+    print(f"  human labels: {human_labels}")
+    print(f"  judge labels: {judge_labels}")
+    print(f"  agreement:    {sum(j == h for j, h in zip(judge_labels, human_labels))}/10")
+    print(f"  Cohen's κ:    {kappa:.4f}")
+    print(f"  position_bias_rate: {bias['position_bias_rate']}  "
+          f"verbosity_bias: {bias['verbosity_bias']}")
