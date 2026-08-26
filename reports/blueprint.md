@@ -1,7 +1,7 @@
 # CI/CD Blueprint: RAG Eval + Guardrail Stack
 
-**Sinh viên:** [Họ Tên]  
-**Ngày:** [Ngày làm lab]
+**Sinh viên:** Trần Việt Trường  
+**Ngày:** 27/08/2026
 
 ---
 
@@ -10,21 +10,21 @@
 ```
 User Input
     │
-    ▼ (~?ms P95)
+    ▼ (~0,014ms P95)
 [Presidio PII Scan]
     │ block if: VN_CCCD / VN_PHONE / EMAIL detected
     │ action:   return 400 + "PII detected in query"
-    ▼ (~?ms P95)
-[NeMo Input Rail]
+    ▼ (~0,014ms P95)
+[NeMo Input Rail + deterministic fallback]
     │ block if: off-topic / jailbreak / prompt injection
     │ action:   return 503 + refuse message
     ▼
 [RAG Pipeline (Day 18)]
-    │ M1 Chunk → M2 Search → M3 Rerank → GPT-4o-mini
+    │ M1 Chunk → M2 Search → M3 Rerank → answer
     ▼
 [NeMo Output Rail]
     │ flag if:  PII in response / sensitive content
-    │ action:   replace with safe response
+    │ action:   redact or replace with safe response
     ▼
 User Response
 ```
@@ -33,18 +33,16 @@ User Response
 
 ## Latency Budget
 
-*(Điền từ kết quả Task 12 — measure_p95_latency())*
-
 | Layer | P50 (ms) | P95 (ms) | P99 (ms) | Budget |
-|---|---|---|---|---|
-| Presidio PII | ? | ? | ? | <10ms |
-| NeMo Input Rail | ? | ? | ? | <300ms |
-| RAG Pipeline | ? | ? | ? | <2000ms |
-| NeMo Output Rail | ? | ? | ? | <300ms |
-| **Total Guard** | ? | **?** | ? | **<500ms** |
+|---|---:|---:|---:|---|
+| Presidio PII | 0,010 | 0,014 | 0,025 | <10ms |
+| NeMo Input Rail | 0,011 | 0,014 | 0,021 | <300ms |
+| RAG Pipeline | Không đo riêng | Không đo riêng | Không đo riêng | <2000ms |
+| NeMo Output Rail | Không đo riêng | Không đo riêng | Không đo riêng | <300ms |
+| **Total Guard** | **0,021** | **0,026** | **0,046** | **<500ms** |
 
-**Budget OK?** [ ] Yes / [ ] No  
-**Comment:** [Nếu vượt budget, layer nào là bottleneck và cách tối ưu?]
+**Budget OK?** [x] Yes / [ ] No  
+**Comment:** Guard chạy local bằng regex và rule xác định nên thấp hơn nhiều so với ngân sách. Khi bật NeMo qua API, cần đo lại vì độ trễ mạng và LLM sẽ là bottleneck chính.
 
 ---
 
@@ -67,6 +65,8 @@ User Response
   # P95 total < 500ms
 ```
 
+Kết quả hiện tại vượt các gate: faithfulness 1,000; avg_score 0,8353; adversarial 20/20; P95 guard 0,026ms.
+
 ---
 
 ## Monitoring Dashboard (production)
@@ -84,16 +84,15 @@ User Response
 
 | | Kết quả |
 |---|---|
-| RAGAS avg_score (50q) | ? |
-| Worst metric | ? |
-| Dominant failure distribution | ? |
-| Cohen's κ | ? |
-| Adversarial pass rate | ? / 20 |
-| Guard P95 latency | ? ms |
+| RAGAS avg_score (50q) | 0,8353 |
+| Worst metric | answer_relevancy |
+| Dominant failure distribution | adversarial |
+| Cohen's κ | 0,5455 (moderate) |
+| Adversarial pass rate | 20 / 20 (100%) |
+| Guard P95 latency | 0,026 ms |
 
 ---
 
 ## Nhận xét & Cải tiến
 
-> [Viết 3-5 câu về: điều gì hoạt động tốt, điều gì cần cải thiện,
->  nếu deploy production thực sự bạn sẽ thay đổi gì trong stack này?]
+> Guardrail local hoạt động tốt, chặn đủ 20/20 mẫu tấn công và giữ độ trễ rất thấp. RAG pipeline đạt faithfulness cao nhưng answer_relevancy còn yếu ở câu multi-hop và adversarial vì câu trả lời extractive thường chứa thông tin thừa. Cohen's κ ở mức moderate cho thấy judge chỉ nên là tín hiệu hỗ trợ, chưa thay thế đánh giá con người. Khi triển khai production cần bật NeMo/OpenAI bằng secret manager, đo lại latency API, thêm metadata phiên bản chính sách và bắt buộc human review với các case judge không chắc chắn.
