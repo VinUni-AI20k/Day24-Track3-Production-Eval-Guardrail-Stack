@@ -5,6 +5,7 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+.worktrees/
 answers_50q.json
 reports/*.json
 !reports/.gitkeep
