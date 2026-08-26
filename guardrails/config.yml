@@ -2,6 +2,13 @@ models:
   - type: main
     engine: openai
     model: gpt-4o-mini
+    # temperature 0 để self-check rail cho kết quả ổn định giữa các lần chạy.
+    parameters:
+      temperature: 0.0
+
+  - type: embeddings
+    engine: openai
+    model: text-embedding-3-small
 
 instructions:
   - type: general
@@ -14,11 +21,7 @@ instructions:
 rails:
   input:
     flows:
-      - check jailbreak
-      - check off topic
-      - check pii request
+      - self check input
   output:
     flows:
-      - check sensitive output
-
-# Colang dialogue flows are defined in rails.co
+      - self check output
